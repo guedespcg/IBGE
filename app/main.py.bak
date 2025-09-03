@@ -1,0 +1,277 @@
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query
+from fastapi.responses import StreamingResponse, JSONResponse
+from sqlalchemy import text
+from typing import Optional
+import io
+import os
+import pandas as pd
+from unidecode import unidecode
+
+from .db import get_engine, ensure_schema
+from .sidra_client import (
+    list_produtos_sidra,
+    list_variaveis_sidra,
+    coletar_pam_por_municipios_produtos,
+    resolve_municipio_codigos_ibge,
+)
+from .reporting import gerar_planilha_filial
+
+app = FastAPI(title="IBGE SIDRA Automation", version="2.0.0")
+
+@app.on_event("startup")
+def _startup():
+    ensure_schema()
+
+@app.get("/healthz")
+def healthz():
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"db_error: {e}")
+
+@app.get("/culturas/template")
+def culturas_template():
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        pd.DataFrame(
+            [
+                {"filial": "SANTA CRUZ DO SUL", "nome_municipio": "Santa Cruz do Sul", "uf": "RS", "codigo_ibge": ""},
+                {"filial": "ITAJAÍ", "nome_municipio": "Itajaí", "uf": "SC", "codigo_ibge": ""},
+                {"filial": "GUARAPUAVA", "nome_municipio": "Guarapuava", "uf": "PR", "codigo_ibge": ""},
+                {"filial": "CRUZEIRO DO SUL", "nome_municipio": "Cruzeiro do Sul", "uf": "RS", "codigo_ibge": ""},
+            ]
+        ).to_excel(w, index=False, sheet_name="municipios")
+        pd.DataFrame(
+            [
+                {"filial": "SANTA CRUZ DO SUL", "tabela": 1612, "cod_produto": 83, "produto": "Milho (em grão)"},
+                {"filial": "SANTA CRUZ DO SUL", "tabela": 1612, "cod_produto": 87, "produto": "Soja (em grão)"},
+            ]
+        ).to_excel(w, index=False, sheet_name="culturas")
+    buf.seek(0)
+    headers = {"Content-Disposition": "attachment; filename=filiais_culturas_template.xlsx"}
+    return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
+
+@app.post("/seed/municipios")
+def seed_municipios(file: UploadFile = File(...)):
+    try:
+        content = file.file.read()
+        xl = pd.ExcelFile(io.BytesIO(content))
+    finally:
+        file.file.close()
+    sheet = next((s for s in xl.sheet_names if unidecode(s).lower().startswith("municipio")), None)
+    if not sheet:
+        raise HTTPException(status_code=400, detail="Aba 'municipios' não encontrada.")
+    df = xl.parse(sheet)
+    cols_map = {}
+    for c in df.columns:
+        k = unidecode(str(c)).strip().lower()
+        if k in ("filial",): cols_map[c] = "filial"
+        elif k in ("municipio","nome_municipio","cidade"): cols_map[c] = "nome_municipio"
+        elif k in ("uf",): cols_map[c] = "uf"
+        elif k in ("codigo_ibge","cod_ibge","id_municipio","id"): cols_map[c] = "codigo_ibge"
+    df = df.rename(columns=cols_map)
+    for col in ("filial","nome_municipio","uf"):
+        if col not in df.columns: raise HTTPException(status_code=400, detail=f"Coluna obrigatória ausente: {col}")
+    df = df[["filial","nome_municipio","uf", *([c for c in ["codigo_ibge"] if c in df.columns])]].copy()
+    df["filial"] = df["filial"].astype(str).str.strip()
+    df["nome_municipio"] = df["nome_municipio"].astype(str).str.strip()
+    df["uf"] = df["uf"].astype(str).str.upper().str.strip()
+    if "codigo_ibge" in df.columns:
+        df["codigo_ibge"] = df["codigo_ibge"].astype(str).str.strip()
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS public.municipios_filiais (
+                id SERIAL PRIMARY KEY,
+                filial TEXT NOT NULL,
+                nome_municipio TEXT NOT NULL,
+                uf CHAR(2) NOT NULL,
+                codigo_ibge VARCHAR(7) NULL
+            );
+        """))
+        for _, r in df.iterrows():
+            conn.execute(
+                text("""
+                    INSERT INTO public.municipios_filiais (filial, nome_municipio, uf, codigo_ibge)
+                    VALUES (:filial, :nome, :uf, NULLIF(:cod_ibge,''))
+                    ON CONFLICT DO NOTHING;
+                """),
+                {"filial": r["filial"], "nome": r["nome_municipio"], "uf": r["uf"], "cod_ibge": r.get("codigo_ibge","")},
+            )
+    return {"status": "ok", "linhas_processadas": int(df.shape[0])}
+
+@app.post("/seed/culturas")
+def seed_culturas(file: UploadFile = File(...)):
+    try:
+        content = file.file.read()
+        xl = pd.ExcelFile(io.BytesIO(content))
+    finally:
+        file.file.close()
+    sheet = next((s for s in xl.sheet_names if unidecode(s).lower().startswith("cultura")), None)
+    if not sheet:
+        raise HTTPException(status_code=400, detail="Aba 'culturas' não encontrada.")
+    df = xl.parse(sheet)
+    cols_map = {}
+    for c in df.columns:
+        k = unidecode(str(c)).strip().lower()
+        if k in ("filial",): cols_map[c] = "filial"
+        elif k in ("tabela","table","agregado"): cols_map[c] = "tabela"
+        elif k in ("cod_produto","produto_id","id_produto","categoria"): cols_map[c] = "cod_produto"
+        elif k in ("produto","nome_produto"): cols_map[c] = "produto"
+    df = df.rename(columns=cols_map)
+    for col in ("filial","tabela","cod_produto"):
+        if col not in df.columns: raise HTTPException(status_code=400, detail=f"Coluna obrigatória ausente: {col}")
+    df = df[["filial","tabela","cod_produto", *([c for c in ["produto"] if c in df.columns])]].copy()
+    df["filial"] = df["filial"].astype(str).str.strip()
+    df["tabela"] = df["tabela"].astype(int)
+    df["cod_produto"] = df["cod_produto"].astype(str).str.strip()
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS public.culturas_filiais (
+                id SERIAL PRIMARY KEY,
+                filial TEXT NOT NULL,
+                tabela INTEGER NOT NULL,
+                cod_produto TEXT NOT NULL,
+                produto TEXT NULL
+            );
+        """))
+        for _, r in df.iterrows():
+            conn.execute(
+                text("""
+                    INSERT INTO public.culturas_filiais (filial, tabela, cod_produto, produto)
+                    VALUES (:filial, :tabela, :cod, :produto)
+                    ON CONFLICT DO NOTHING;
+                """),
+                {"filial": r["filial"], "tabela": int(r["tabela"]), "cod": r["cod_produto"], "produto": r.get("produto")},
+            )
+    return {"status": "ok", "linhas_processadas": int(df.shape[0])}
+
+@app.get("/sidra/produtos/{tabela}")
+def sidra_produtos(tabela: int):
+    try:
+        data = list_produtos_sidra(tabela)
+        return {"tabela": tabela, "total": len(data), "produtos": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"erro_sidra: {e}")
+
+@app.get("/sidra/variaveis/{tabela}")
+def sidra_variaveis(tabela: int):
+    try:
+        data = list_variaveis_sidra(tabela)
+        return {"tabela": tabela, "total": len(data), "variaveis": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"erro_sidra: {e}")
+
+@app.post("/coletar")
+def coletar(
+    ano: Optional[int] = Query(None),
+    filial: Optional[str] = Query(None),
+    produtos: Optional[str] = Query(None),
+):
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS public.dados_sidra_brutos (
+                id BIGSERIAL PRIMARY KEY,
+                ano INT NOT NULL,
+                tabela INT NOT NULL,
+                variavel INT NOT NULL,
+                uf CHAR(2) NOT NULL DEFAULT '',
+                municipio TEXT NOT NULL,
+                codigo_ibge VARCHAR(7) NOT NULL,
+                cod_produto TEXT NOT NULL,
+                produto TEXT NULL,
+                valor NUMERIC NULL,
+                unidade TEXT NULL,
+                fonte TEXT NOT NULL DEFAULT 'SIDRA',
+                filial TEXT NOT NULL,
+                criado_em TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+            );
+        """))
+        if filial:
+            muni = conn.execute(text("""
+                SELECT filial, nome_municipio, uf, COALESCE(codigo_ibge,'') AS codigo_ibge
+                FROM public.municipios_filiais WHERE filial = :f
+            """), {"f": filial}).mappings().all()
+        else:
+            muni = conn.execute(text("""
+                SELECT filial, nome_municipio, uf, COALESCE(codigo_ibge,'') AS codigo_ibge
+                FROM public.municipios_filiais
+            """)).mappings().all()
+        if not muni:
+            raise HTTPException(status_code=409, detail="Tabela 'municipios_filiais' vazia ou filial não encontrada.")
+
+        faltantes = [(m["nome_municipio"], m["uf"]) for m in muni if not m["codigo_ibge"]]
+        mapa = resolve_municipio_codigos_ibge(faltantes)
+        muni_norm = []
+        for m in muni:
+            cod = m["codigo_ibge"] or mapa.get((unidecode(m["nome_municipio"]).lower(), m["uf"]))
+            if not cod:
+                raise HTTPException(status_code=422, detail=f"Não consegui resolver código IBGE para {m['nome_municipio']}/{m['uf']}.")
+            muni_norm.append({"filial": m["filial"], "municipio": m["nome_municipio"], "uf": m["uf"], "codigo_ibge": str(cod)})
+
+        if produtos:
+            culturas = {1612: [{"cod_produto": p.strip(), "produto": None, "filial": filial or "ALL"} for p in produtos.split(",") if p.strip()]}
+        else:
+            rows = conn.execute(
+                text("SELECT filial, tabela, cod_produto, produto FROM public.culturas_filiais" + (" WHERE filial = :f" if filial else "")),
+                ({"f": filial} if filial else {}),
+            ).mappings().all()
+            if not rows:
+                raise HTTPException(status_code=409, detail="Tabela 'culturas_filiais' vazia. Use /seed/culturas ou passe ?produtos=.")
+            culturas = {}
+            for r in rows:
+                culturas.setdefault(int(r["tabela"]), []).append({"filial": r["filial"], "cod_produto": str(r["cod_produto"]), "produto": r.get("produto")})
+
+        total = 0
+        for tabela, itens in culturas.items():
+            filiais_tbl = set(r["filial"] for r in itens) if not produtos else set([filial or m["filial"] for m in muni_norm])
+            muni_tbl = [m for m in muni_norm if (m["filial"] in filiais_tbl or not filial)]
+
+            res = coletar_pam_por_municipios_produtos(
+                tabela=tabela,
+                ano=ano,
+                municipio_codigos=[m["codigo_ibge"] for m in muni_tbl],
+                produtos=[r["cod_produto"] for r in itens],
+            )
+            for row in res:
+                fil = next((m["filial"] for m in muni_tbl if m["codigo_ibge"] == row["codigo_ibge"]), None) or (filial or "ALL")
+                conn.execute(text("""
+                    INSERT INTO public.dados_sidra_brutos
+                        (ano, tabela, variavel, uf, municipio, codigo_ibge, cod_produto, produto, valor, unidade, fonte, filial)
+                    VALUES
+                        (:ano, :tabela, :variavel, :uf, :municipio, :codigo_ibge, :cod_produto, :produto, :valor, :unidade, 'SIDRA', :filial)
+                    ON CONFLICT DO NOTHING;
+                """),
+                {
+                    "ano": row["ano"], "tabela": tabela, "variavel": row["variavel"], "uf": row["uf"],
+                    "municipio": row["municipio"], "codigo_ibge": row["codigo_ibge"],
+                    "cod_produto": row["cod_produto"], "produto": row.get("produto"),
+                    "valor": None if row["valor"] in (None, "", "...") else row["valor"],
+                    "unidade": row.get("unidade"), "filial": fil,
+                })
+                total += 1
+    return {"status": "ok", "linhas_gravadas": total}
+
+@app.get("/relatorio/{filial}")
+def relatorio_filial(filial: str, ano: int):
+    engine = get_engine()
+    with engine.connect() as conn:
+        df = pd.read_sql_query(
+            text("""
+                SELECT ano, tabela, variavel, uf, municipio, codigo_ibge, cod_produto, produto, valor, unidade
+                FROM public.dados_sidra_brutos
+                WHERE filial = :filial AND ano = :ano
+                ORDER BY tabela, cod_produto, municipio
+            """),
+            conn, params={"filial": filial, "ano": ano},
+        )
+    if df.empty:
+        return JSONResponse({"status":"vazio","mensagem":"Nenhum dado para esta filial/ano."}, status_code=204)
+    buf = gerar_planilha_filial(df, filial, ano)
+    headers = {"Content-Disposition": f"attachment; filename=relatorio_{filial}_{ano}.xlsx"}
+    return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
